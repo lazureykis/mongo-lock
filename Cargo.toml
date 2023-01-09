@@ -16,6 +16,6 @@ rand = "*"
 tokio = "*"
 
 [features]
-default = []
+default = ["async"]
 sync = ["mongodb/sync"]
 async = ["mongodb/default"]
