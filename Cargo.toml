@@ -8,14 +8,5 @@ description = "Distributed locks with MongoDB"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-mongodb = { version = "2", optional = true, default-features = false }
-tokio = { version = "*", optional = true }
+mongodb = { version = "2", default-features = false, features = ["sync"] }
 rand = "*"
-
-[dev-dependencies]
-tokio = "*"
-
-[features]
-default = ["async"]
-sync = ["mongodb/sync"]
-async = ["mongodb/default"]
