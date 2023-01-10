@@ -1,3 +1,35 @@
+#![doc(issue_tracker_base_url = "https://github.com/lazureykis/mongo-lock/issues")]
+
+//! Distributed mutually exclusive locks in MongoDB.
+//!
+//! This crate contains only sync implementation.
+//! If you need a async version, use [`mongo-lock-async`](https://crates.io/crates/mongo-lock-async) crate.
+//!
+//! This implementation relies on system time. Ensure that NTP clients on your servers are configured properly.
+//!
+//! Usage:
+//! ```rust
+//! fn main() {
+//!     let mongo = mongodb::sync::Client::with_uri_str("mongodb://localhost").unwrap();
+//!
+//!     // We need to ensure that mongodb collection has a proper index.
+//!     mongo_lock::prepare_database(&mongo).unwrap();
+//!
+//!     if let Ok(Some(lock)) =
+//!         mongo_lock::Lock::try_acquire(
+//!             &mongo,
+//!             "my-key",
+//!             std::time::Duration::from_secs(30)
+//!         )
+//!     {
+//!         println!("Lock acquired.");
+//!
+//!         // Release the lock before ttl expires to allow others to acquire it.
+//!         lock.release().ok();
+//!     }
+//! }
+//! ```
+
 mod util;
 
 const COLLECTION_NAME: &str = "locks";
@@ -18,10 +50,14 @@ fn collection(mongo: &Client) -> Collection<Document> {
         .collection(COLLECTION_NAME)
 }
 
+/// Prepares MongoDB collection to store locks.
+///
+/// Creates TTL index to remove old records after they expire.
+///
+/// The [Lock] itself does not relies on this index,
+/// because MongoDB can remove documents with some significant delay.
 pub fn prepare_database(mongo: &Client) -> Result<(), Error> {
     let options = IndexOptions::builder()
-        // .unique(true)
-        // .partial_filter_expression(doc! { "expiresAt": 1 })
         .expire_after(Some(Duration::from_secs(0)))
         .build();
 
@@ -35,45 +71,73 @@ pub fn prepare_database(mongo: &Client) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn lock(mongo: &Client, key: &str, ttl: Duration) -> Result<bool, mongodb::error::Error> {
-    let (now, expires_at) = util::now_and_expires_at(ttl);
+/// Distributed mutex lock.
+pub struct Lock {
+    mongo: Client,
+    id: String,
+    acquired: bool,
+}
 
-    // Update expired locks if mongodb didn't clean it yet.
-    let query = doc! {
-        "_id": key,
-        "expiresAt": {"$lte": now},
-    };
+impl Lock {
+    /// Tries to acquire the lock with the given key.
+    pub fn try_acquire(
+        mongo: &Client,
+        key: &str,
+        ttl: Duration,
+    ) -> Result<Option<Lock>, mongodb::error::Error> {
+        let (now, expires_at) = util::now_and_expires_at(ttl);
 
-    let update = doc! {
-        "$set": {
-            "expiresAt": expires_at,
-        },
-        "$setOnInsert": {
+        // Update expired locks if mongodb didn't clean it yet.
+        let query = doc! {
             "_id": key,
-        },
-    };
+            "expiresAt": {"$lte": now},
+        };
 
-    let options = UpdateOptions::builder().upsert(true).build();
+        let update = doc! {
+            "$set": {
+                "expiresAt": expires_at,
+            },
+            "$setOnInsert": {
+                "_id": key,
+            },
+        };
 
-    match collection(mongo).update_one(query, update, options) {
-        Ok(result) => Ok(result.upserted_id.is_some() || result.modified_count == 1),
-        Err(err) => {
-            if let ErrorKind::Write(WriteFailure::WriteError(WriteError { code: 11000, .. })) =
-                *err.kind
-            {
-                println!("key={key} KEY IS NOT EXPIRED, CANNOT SET LOCK");
-                Ok(false)
-            } else {
-                Err(err)
+        let options = UpdateOptions::builder().upsert(true).build();
+
+        match collection(mongo).update_one(query, update, options) {
+            Ok(result) => {
+                if result.upserted_id.is_some() || result.modified_count == 1 {
+                    Ok(Some(Lock {
+                        mongo: mongo.clone(),
+                        id: key.to_string(),
+                        acquired: true,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(err) => {
+                if let ErrorKind::Write(WriteFailure::WriteError(WriteError {
+                    code: 11000, ..
+                })) = *err.kind
+                {
+                    Ok(None)
+                } else {
+                    Err(err)
+                }
             }
         }
     }
-}
 
-pub fn release(mongo: &Client, key: &str) -> Result<bool, mongodb::error::Error> {
-    let result = collection(mongo).delete_one(doc! {"_id": key}, None)?;
+    pub fn release(&self) -> Result<bool, mongodb::error::Error> {
+        if self.acquired {
+            let result = collection(&self.mongo).delete_one(doc! {"_id": &self.id}, None)?;
 
-    Ok(result.deleted_count == 1)
+            Ok(result.deleted_count == 1)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -100,26 +164,23 @@ mod tests {
         let key1 = gen_random_key();
         let key2 = gen_random_key();
 
-        let locked1 = lock(&mongo, &key1, Duration::from_secs(5)).unwrap();
-        assert!(locked1);
+        let lock1 = Lock::try_acquire(&mongo, &key1, Duration::from_secs(5)).unwrap();
+        assert!(lock1.is_some());
 
-        let locked1 = lock(&mongo, &key1, Duration::from_secs(5)).unwrap();
-        assert!(!locked1);
+        let lock1_dup = Lock::try_acquire(&mongo, &key1, Duration::from_secs(5)).unwrap();
+        assert!(lock1_dup.is_none());
 
-        let released1 = release(&mongo, &key1).unwrap();
+        let released1 = lock1.unwrap().release().unwrap();
         assert!(released1);
 
-        let released1 = release(&mongo, &key1).unwrap();
-        assert!(!released1);
+        let lock1 = Lock::try_acquire(&mongo, &key1, Duration::from_secs(5)).unwrap();
+        assert!(lock1.is_some());
 
-        let locked1 = lock(&mongo, &key1, Duration::from_secs(5)).unwrap();
-        assert!(locked1);
+        let lock2 = Lock::try_acquire(&mongo, &key2, Duration::from_secs(5)).unwrap();
+        assert!(lock2.is_some());
 
-        let locked2 = lock(&mongo, &key2, Duration::from_secs(5)).unwrap();
-        assert!(locked2);
-
-        release(&mongo, &key1).unwrap();
-        release(&mongo, &key2).unwrap();
+        lock1.unwrap().release().unwrap();
+        lock2.unwrap().release().unwrap();
     }
 
     #[test]
@@ -130,12 +191,14 @@ mod tests {
 
         let key = gen_random_key();
 
-        assert!(lock(&mongo, &key, Duration::from_secs(1)).unwrap());
+        assert!(Lock::try_acquire(&mongo, &key, Duration::from_secs(1))
+            .unwrap()
+            .is_some());
 
         std::thread::sleep(Duration::from_secs(1));
 
-        assert!(lock(&mongo, &key, Duration::from_secs(1)).unwrap());
-
-        assert!(release(&mongo, &key).unwrap());
+        assert!(Lock::try_acquire(&mongo, &key, Duration::from_secs(1))
+            .unwrap()
+            .is_some());
     }
 }
