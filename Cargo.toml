@@ -3,10 +3,15 @@ name = "mongo-lock"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Distributed locks with MongoDB"
+description = "Distributed mutex locks with MongoDB"
+authors = ["Pavel Lazureykis"]
+documentation = "https://docs.rs/mongo-lock"
+repository = "https://github.com/lazureykis/mongo-lock"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 mongodb = { version = "2", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
 rand = "*"
