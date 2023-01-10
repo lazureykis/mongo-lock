@@ -24,8 +24,7 @@
 //!     {
 //!         println!("Lock acquired.");
 //!
-//!         // Release the lock before ttl expires to allow others to acquire it.
-//!         lock.release().ok();
+//!         // The lock will be released automatically after leaving the scope.
 //!     }
 //! }
 //! ```
@@ -129,14 +128,22 @@ impl Lock {
         }
     }
 
-    pub fn release(&self) -> Result<bool, mongodb::error::Error> {
+    fn release(&mut self) -> Result<bool, mongodb::error::Error> {
         if self.acquired {
             let result = collection(&self.mongo).delete_one(doc! {"_id": &self.id}, None)?;
+
+            self.acquired = false;
 
             Ok(result.deleted_count == 1)
         } else {
             Ok(false)
         }
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        self.release().ok();
     }
 }
 
@@ -200,5 +207,37 @@ mod tests {
         assert!(Lock::try_acquire(&mongo, &key, Duration::from_secs(1))
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn dropped_locks() {
+        let mongo = Client::with_uri_str("mongodb://localhost").unwrap();
+
+        prepare_database(&mongo).unwrap();
+
+        let key = gen_random_key();
+
+        {
+            assert!(Lock::try_acquire(&mongo, &key, Duration::from_secs(1))
+                .unwrap()
+                .is_some());
+        }
+
+        {
+            assert!(Lock::try_acquire(&mongo, &key, Duration::from_secs(1))
+                .unwrap()
+                .is_some());
+        }
+
+        let lock1 = Lock::try_acquire(&mongo, &key, Duration::from_secs(1)).unwrap();
+        let lock2 = Lock::try_acquire(&mongo, &key, Duration::from_secs(1)).unwrap();
+
+        assert!(lock1.is_some());
+        assert!(lock2.is_none());
+
+        drop(lock1);
+
+        let lock3 = Lock::try_acquire(&mongo, &key, Duration::from_secs(1)).unwrap();
+        assert!(lock3.is_some());
     }
 }
