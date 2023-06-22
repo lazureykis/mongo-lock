@@ -29,13 +29,16 @@
 //! }
 //! ```
 
+mod error;
 mod util;
+
+pub use error::Error;
 
 const COLLECTION_NAME: &str = "locks";
 const DEFAULT_DB_NAME: &str = "mongo-lock";
 
 use mongodb::bson::{doc, Document};
-use mongodb::error::{Error, ErrorKind, WriteError, WriteFailure};
+use mongodb::error::{ErrorKind, WriteError, WriteFailure};
 use mongodb::options::{IndexOptions, UpdateOptions};
 use mongodb::sync::{Client, Collection};
 use mongodb::IndexModel;
@@ -79,11 +82,7 @@ pub struct Lock {
 
 impl Lock {
     /// Tries to acquire the lock with the given key.
-    pub fn try_acquire(
-        mongo: &Client,
-        key: &str,
-        ttl: Duration,
-    ) -> Result<Option<Lock>, mongodb::error::Error> {
+    pub fn try_acquire(mongo: &Client, key: &str, ttl: Duration) -> Result<Option<Lock>, Error> {
         let (now, expires_at) = util::now_and_expires_at(ttl);
 
         // Update expired locks if mongodb didn't clean it yet.
@@ -122,7 +121,31 @@ impl Lock {
                 {
                     Ok(None)
                 } else {
-                    Err(err)
+                    Err(err.into())
+                }
+            }
+        }
+    }
+
+    /// Tries to acquire the lock with the given key.
+    /// If the lock is already acquired, waits for it to be released
+    /// up to `lock_wait_timeout` time checking every `lock_poll_interval`.
+    pub fn try_acquire_with_timeout(
+        mongo: &Client,
+        key: &str,
+        key_ttl: Duration,
+        lock_wait_timeout: Duration,
+        lock_poll_interval: Duration,
+    ) -> Result<Option<Lock>, Error> {
+        let start = std::time::Instant::now();
+        loop {
+            match Lock::try_acquire(mongo, key, key_ttl)? {
+                Some(lock) => return Ok(Some(lock)),
+                None => {
+                    if start.elapsed() > lock_wait_timeout {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(lock_poll_interval);
                 }
             }
         }
@@ -198,15 +221,45 @@ mod tests {
 
         let key = gen_random_key();
 
+        let lock = Lock::try_acquire(&mongo, &key, Duration::from_secs(1)).unwrap();
+        assert!(lock.is_some());
+
         assert!(Lock::try_acquire(&mongo, &key, Duration::from_secs(1))
             .unwrap()
-            .is_some());
+            .is_none());
 
         std::thread::sleep(Duration::from_secs(1));
 
         assert!(Lock::try_acquire(&mongo, &key, Duration::from_secs(1))
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn with_ttl_and_retry() {
+        let mongo = Client::with_uri_str("mongodb://localhost").unwrap();
+
+        prepare_database(&mongo).unwrap();
+
+        let key = gen_random_key();
+
+        let lock = Lock::try_acquire(&mongo, &key, Duration::from_secs(1)).unwrap();
+        assert!(lock.is_some());
+
+        let time = std::time::Instant::now();
+
+        let lock2 = Lock::try_acquire_with_timeout(
+            &mongo,
+            &key,
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        assert!(lock2.is_some());
+
+        assert!(time.elapsed() > Duration::from_secs(1));
     }
 
     #[test]
